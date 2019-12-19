@@ -17,7 +17,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#define DEBUG 1
+#define DEBUG 0
 #define KEY_SIZE 32
 #define RECORD_SIZE 64
 
@@ -197,11 +197,11 @@ int binary_file_search(FILE* f, uint8_t* key, uint8_t* entry_out, uint64_t* bala
             record += search_size;
         }
 
-        if (DEBUG) printf("search size: %lu, current record: %d, check_prev: %d, dir: %d\n", search_size, record, check_prev, search_direction);
+        if (DEBUG) printf("search size: %lu, current record: %lu, check_prev: %d, dir: %d\n", search_size, record, check_prev, search_direction);
 
         if (record < 0 || record >= recordcount) {
             if (DEBUG)
-                fprintf(stderr, "could not find key record: %lu, recordcount: %lu\n", record, recordcount);
+                fprintf(stderr, "could not find key record: %lu, recordcount: %d\n", record, recordcount);
             if (entry_out)
                 for (int i = 0; i < RECORD_SIZE; ++i)
                     entry_out[i] = entry[i];            
@@ -227,7 +227,7 @@ int insert_record(FILE* f, uint8_t* entry, size_t recordno) {
     if (!file_buffer)
         file_buffer = (uint8_t*)malloc(MAX(FILE_BUFFER_SIZE, RECORD_SIZE));
     
-    if (DEBUG) printf("insert_record called with recno=%d\n", recordno);
+    if (DEBUG) printf("insert_record called with recno=%lu\n", recordno);
     //uint8_t* buffer[FILE_BUFFER_SIZE];
 
     size_t offset = recordno * RECORD_SIZE;
@@ -261,7 +261,7 @@ int insert_record(FILE* f, uint8_t* entry, size_t recordno) {
         // now if there are any other pieces to move along we can move them
         if (size - endpiece >= FILE_BUFFER_SIZE)
         for (size_t cursor = size - endpiece - FILE_BUFFER_SIZE; cursor > offset; cursor -= FILE_BUFFER_SIZE) {
-            if (DEBUG)  printf("moving %lu sized piece at %lu to %lu - size: %lu - offset: %lu\n", FILE_BUFFER_SIZE, cursor, cursor + RECORD_SIZE, size, offset);
+            if (DEBUG)  printf("moving %d sized piece at %lu to %lu - size: %lu - offset: %lu\n", FILE_BUFFER_SIZE, cursor, cursor + RECORD_SIZE, size, offset);
             fseek(f, cursor, SEEK_SET);
             fread(file_buffer, 1, FILE_BUFFER_SIZE, f);
             fseek(f, cursor + RECORD_SIZE, SEEK_SET);
@@ -290,7 +290,8 @@ int valid_hex(char* hex, int len) {
 int pass_through_mode(int argc, char** argv) {
     // full argc, argv are in tact in this mode
 
-    printf("pass through mode\n");
+    if (DEBUG)
+        printf("pass through mode\n");
 
     int teepipe[2];
     int error = pipe(teepipe);
@@ -356,7 +357,7 @@ int pass_through_mode(int argc, char** argv) {
 
             // check the key is valid
             if (DEBUG)
-                printf("key length: %d, proper length: %d\n", strlen(buf+3), KEY_SIZE*2);
+                printf("key length: %lu, proper length: %d\n", strlen(buf+3), KEY_SIZE*2);
             if (DEBUG)
                 printf("hex: `%s`\n", buf+3);
             if (strlen(buf+3) != KEY_SIZE*2 || !valid_hex(buf+3, KEY_SIZE*2)) {
@@ -397,7 +398,7 @@ int pass_through_mode(int argc, char** argv) {
             uint8_t entry[64];
             if (binary_file_search(f, key, entry, &balance, &recordno, &error)) {
                 // key already exists, update it
-                if (DEBUG) printf("writing 64 bytes at record:%d\n", recordno);
+                if (DEBUG) printf("writing 64 bytes at record:%lu\n", recordno);
                 fseek(f, recordno*RECORD_SIZE, SEEK_SET);
                 uint64_t balance = uint64_from_bytes(entry+32);
                 balance = new_balance(balance, -to_bill);
@@ -422,7 +423,7 @@ int pass_through_mode(int argc, char** argv) {
    
     fclose(f);
  
-    execv("/bin/cat", argv);
+    execv(argv[1], argv+1);
     
 }
 
@@ -490,7 +491,7 @@ int credit_mode(int argc, char** argv) {
         uint8_t entry[64];
         if (binary_file_search(f, key, entry, &balance, &recordno, &error)) {
             // key already exists, update it
-            if (DEBUG) printf("writing 64 bytes at record:%d\n", recordno);
+            if (DEBUG) printf("writing 64 bytes at record:%lu\n", recordno);
             fseek(f, recordno*RECORD_SIZE, SEEK_SET);
             uint64_t balance = uint64_from_bytes(entry+32);
             balance = new_balance(balance, to_credit);
@@ -619,8 +620,13 @@ int main(int argc, char** argv) {
         mode = 3; // mode 3 balance mode [ read only ]
 
 
-    if (mode == 0)
+    if (mode == 0) {
+        if (argc < 2)  {
+            fprintf(stderr, "appbill requires an executable to pass execution to as an argument when running in pass through mode\n");
+            return 128;
+        }
         return pass_through_mode(argc, argv);
+    }
     
     if (argc < 3) {
         fprintf(stderr, "appbill was not supplied sufficient arguments\n");
