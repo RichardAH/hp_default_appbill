@@ -12,7 +12,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <inttypes.h>
-
+#include <fcntl.h>
+#include <sys/uio.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 #define DEBUG 0
 #define KEY_SIZE 32
@@ -24,6 +27,20 @@
 #define MAX(a,b) (((a)>(b))?(a):(b))
 
 #define TABLE_FILE "appbill.table"
+
+uint64_t new_balance(uint64_t balance, int64_t to_credit) {
+    if (to_credit < 0 && -to_credit > balance) {
+        // catch the wrap around
+        balance = 0;
+    } else if (to_credit > 0 && to_credit + balance < balance) {
+        // and here as well
+        balance = (uint64_t)-1;
+    } else {
+        // normal crediting
+        balance += to_credit;
+    }
+    return balance;
+}
 
 void print_hex(uint8_t* data, int len) {
     for (int c = 0; c < len; ++c)
@@ -248,21 +265,123 @@ int insert_record(FILE* f, uint8_t* entry, size_t recordno) {
 
 int pass_through_mode(int argc, char** argv) {
     // full argc, argv are in tact in this mode
+
+    printf("pass through mode\n");
+
+    int teepipe[2];
+    int error = pipe(teepipe);
+    if (error) {
+        fprintf(stderr, "appbill pass through could not create a pipe for teeing fdlist\n");
+        return 128;
+    }
+
+
+    // todo: make this all zero copy when someone has time to debug tee and vmsplice readmode    
+    // for now we'll just do a dumb read
+
+    FILE* f = fopen(TABLE_FILE, "rb+");
+    if (!f) {
+        fprintf(stderr, "could not open %s\n", TABLE_FILE);
+        return 128;
+    }    
+
+    char line[1024];
+    int mode = 0;
+    while (fgets(line, 1023, stdin)) {
+        line[1023] = '\0';
+        printf("line was: %s", line);
+        write(teepipe[1], line, strlen(line));
+        
+        if (mode == 0) {
+            if (strstr(line, "\"usrfd\""))
+                mode = 1;
+        } else if (mode == 1) {
+            if (strstr(line, "}"))
+                break;
+
+            // execution to here means we're looking at a usrfd line
+            // we will bill based on bytes
+            // 'being on the line' costs 1 coin per round
+            // transmitting bytes costs 1 coin per byte
+
+            char* x = line;
+            // find the first " or '
+            for (; *x != '\0' && *x != '\n' && *x != '"' && *x != '\''; ++x);
+            // skip invalid lines
+            if (*x == '\0' || *x == '\n')
+                continue;
+
+            char strdelim = *x++;
+            
+            char* pubkeyhex = x;
+            for (; *x != '\0' && *x != '\n' && *x != strdelim && *x >= '0' && (*x <= '9' || *x >= 'a' && *x <= 'f' || *x >= 'A' && *x <= 'F'); ++x);
+            // skip invalid lines
+            if (*x != strdelim)
+                continue;
+
+            *x = '\0';
+
+            // invalid key            
+            if (strlen(pubkeyhex) != KEY_SIZE*2)
+                continue;
+
+            uint8_t key[KEY_SIZE];
+            
+            key_from_hex((uint8_t*)pubkeyhex, key);
+
+            // execution to here means we have a valid public key
+
+            //nb:todo: this code assumes the fds are on the same line/inline
+            // we can now parse fds
+            for(; *x != '\0' && *x != '\n' && *x != '[' && *x != ']'; ++x);
+
+            if (*x++ != '[')
+                continue;
+
+            int userfd;
+            if (!sscanf(x, "%d", &userfd))
+                continue;
+
+            // execution to here means we have public key and userfd
+
+            int nbytes;
+            ioctl(userfd, FIONREAD, &nbytes);
+
+            int64_t to_bill = 1 + nbytes;
+
+            // commence billing
+
+            int error = 0;
+            uint64_t balance = 0;
+            size_t recordno = 0;
+            uint8_t entry[64];
+            if (binary_file_search(f, key, entry, &balance, &recordno, &error)) {
+                // key already exists, update it
+                if (DEBUG) printf("writing 64 bytes at record:%d\n", recordno);
+                fseek(f, recordno*RECORD_SIZE, SEEK_SET);
+                uint64_t balance = uint64_from_bytes(entry+32);
+                balance = new_balance(balance, -to_bill);
+                uint64_to_bytes(entry+32, balance);
+                fwrite(entry, RECORD_SIZE, 1, f);
+            } else { 
+                // is user doesn't exist this is an error but we can't do anything about it in passthrough mode so ignore 
+                continue;
+            }
+
+        }
+        
+    }
+
+    
+    close(teepipe[1]);
+    dup2(teepipe[0], 0);
+   
+    fclose(f);
+ 
+    execv("/bin/cat", argv);
+    
 }
 
-uint64_t new_balance(uint64_t balance, int64_t to_credit) {
-    if (to_credit < 0 && -to_credit > balance) {
-        // catch the wrap around
-        balance = 0;
-    } else if (to_credit > 0 && to_credit + balance < balance) {
-        // and here as well
-        balance = (uint64_t)-1;
-    } else {
-        // normal crediting
-        balance += to_credit;
-    }
-    return balance;
-}
 
 
 int credit_mode(int argc, char** argv) {
@@ -435,6 +554,8 @@ int check_mode(int argc, char** argv, int print_balances) {
 }
 
 int main(int argc, char** argv) {
+
+    
     
     // input checks
 
