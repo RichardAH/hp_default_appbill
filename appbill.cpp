@@ -530,6 +530,9 @@ int credit_mode(int argc, char** argv) {
 
 int check_mode(int argc, char** argv, int print_balances) {
 
+    if (DEBUG)
+        printf("check mode\n");
+
     if (argc > 7 && !print_balances) {
         fprintf(stderr, "appbill can only take up to 7 keys at a time\n");
         return 128;
@@ -581,12 +584,12 @@ int check_mode(int argc, char** argv, int print_balances) {
         int error = 0;
         uint64_t balance = 0;
         size_t recordno = 0;
-        if (binary_file_search(f, key, 0, &balance, &recordno, &error) && balance > 0) {
+        if (binary_file_search(f, key, 0, &balance, &recordno, &error)) {
             if (i < 7) bits[i] = 1;
             if (print_balances) {
                 printf("\t\"");
                 print_hex(key, KEY_SIZE);
-                printf("\": %lu,\n", balance);
+                printf("\": %lu%s", balance, (i == argc-1 ? "\n": ",\n"));
             }
         }
     }
