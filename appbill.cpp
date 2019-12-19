@@ -17,7 +17,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#define DEBUG 0
+#define DEBUG 1
 #define KEY_SIZE 32
 #define RECORD_SIZE 64
 
@@ -27,6 +27,7 @@
 #define MAX(a,b) (((a)>(b))?(a):(b))
 
 #define TABLE_FILE "appbill.table"
+
 
 uint64_t new_balance(uint64_t balance, int64_t to_credit) {
     if (to_credit < 0 && -to_credit > balance) {
@@ -51,6 +52,21 @@ int compar (const void* p1, const void* p2) {
     for (uint8_t* c1 = (uint8_t*)p1, * c2 = (uint8_t*)p2; c1 - (uint8_t*)p1 < KEY_SIZE; ++c1, ++c2)
         if (*c1 < *c2) return -1;
         else if (*c1 > *c2) return +1;
+    return 0;
+}
+
+
+int correct_for_ed_keys(int argc, char** argv, int incr, int offset) {
+    // correct for ed keys
+    for (int i = 0; i < argc; i += incr)  {
+        int len = strlen(argv[i + offset]);
+        if (len == KEY_SIZE*2 + 2 && (argv[i][0] == 'e' || argv[i][0] == 'E') && (argv[i][1] == 'd' || argv[i][1] == 'D'))
+            argv[i]+=2;
+        else if (len != KEY_SIZE*2) {
+            fprintf(stderr, "appbill received an invalid key %s, expected len=%d actual len=%d\n", argv[i], KEY_SIZE*2, len);
+            return 128;
+        }
+    }
     return 0;
 }
 
@@ -97,7 +113,9 @@ int binary_file_search(FILE* f, uint8_t* key, uint8_t* entry_out, uint64_t* bala
     int recordcount = tablesize / RECORD_SIZE;
 
     size_t record = recordcount/2;
-    size_t search_size = record;
+    size_t search_size = (recordcount == 1 ? 1 : record);
+
+    
 
     uint8_t entry_array[RECORD_SIZE*2];
     uint8_t* entry = entry_array + RECORD_SIZE;
@@ -263,6 +281,12 @@ int insert_record(FILE* f, uint8_t* entry, size_t recordno) {
 }
 
 
+int valid_hex(char* hex, int len) {
+    char* x = hex;
+    for (; (x-hex) < len && *x != '\0' && *x != '\n' && *x >= '0' && (*x <= '9' || *x >= 'a' && *x <= 'f' || *x >= 'A' && *x <= 'F'); ++x);
+    return x-hex == len;
+}
+
 int pass_through_mode(int argc, char** argv) {
     // full argc, argv are in tact in this mode
 
@@ -285,69 +309,85 @@ int pass_through_mode(int argc, char** argv) {
         return 128;
     }    
 
-    char line[1024];
+    char buf[1024];
     int mode = 0;
-    while (fgets(line, 1023, stdin)) {
-        line[1023] = '\0';
-        printf("line was: %s", line);
-        write(teepipe[1], line, strlen(line));
+    int bytes_read = 0;
+
+    int counter = 0;
+    int toskip = 0;
+
+    uint8_t key[KEY_SIZE];
+
+    do {
+        char c = 0;
+        bytes_read = 0;
+        while ( (c = getc( stdin )) != EOF && c != ',' && c != '{' && c != '}' && c != '[' && c != ']' && c != '\n' && c != ':' && bytes_read < 1023 )
+            buf[bytes_read++] = c;
+        buf[bytes_read] = '\0';
+
+        if (mode == 0 && strcmp("\"usrfd\"", buf) == 0)  {
+            mode = 1;
+            continue;
+        }  else if ( mode == 1 && c == '}' ) {
+            break;
+        } 
+
+        if (buf[0] == '\0' || !mode)
+            continue;
         
-        if (mode == 0) {
-            if (strstr(line, "\"usrfd\""))
-                mode = 1;
-        } else if (mode == 1) {
-            if (strstr(line, "}"))
-                break;
+        ++counter %= 3;
 
-            // execution to here means we're looking at a usrfd line
-            // we will bill based on bytes
-            // 'being on the line' costs 1 coin per round
-            // transmitting bytes costs 1 coin per byte
+        // this runs if there's an error in the user's public key
+        if (toskip) {
+            toskip--;
+            continue;
+        }
+        
 
-            char* x = line;
-            // find the first " or '
-            for (; *x != '\0' && *x != '\n' && *x != '"' && *x != '\''; ++x);
-            // skip invalid lines
-            if (*x == '\0' || *x == '\n')
+        if (DEBUG)
+            printf("mode=%d counter=%d component `%s`\n", mode, counter%3, buf);
+
+        if (counter == 1) {
+            // this is the user key
+            // remove trailing "
+            if (!buf[strlen(buf)-1] == '"')
+                continue;
+            buf[strlen(buf)-1] = '\0';
+
+            // check the key is valid
+            if (DEBUG)
+                printf("key length: %d, proper length: %d\n", strlen(buf+3), KEY_SIZE*2);
+            if (DEBUG)
+                printf("hex: `%s`\n", buf+3);
+            if (strlen(buf+3) != KEY_SIZE*2 || !valid_hex(buf+3, KEY_SIZE*2)) {
+                toskip = 2;
+                if (DEBUG)
+                    printf("invald public key %s\n", buf+3);
+                continue;
+            }
+
+            key_from_hex((uint8_t*)buf+3, key);
+            if (DEBUG) {
+                printf("parsed key: ");
+                print_hex(key, KEY_SIZE);
+                printf("\n");
+            }
+        } else if (counter == 2) {
+            // this is the user's input fd
+
+            int userfd = 0;
+            if (!sscanf(buf, "%d", &userfd))
                 continue;
 
-            char strdelim = *x++;
-            
-            char* pubkeyhex = x;
-            for (; *x != '\0' && *x != '\n' && *x != strdelim && *x >= '0' && (*x <= '9' || *x >= 'a' && *x <= 'f' || *x >= 'A' && *x <= 'F'); ++x);
-            // skip invalid lines
-            if (*x != strdelim)
-                continue;
+            if (DEBUG) printf("mode=2 userfd=%d\n", userfd);
 
-            *x = '\0';
-
-            // invalid key            
-            if (strlen(pubkeyhex) != KEY_SIZE*2)
-                continue;
-
-            uint8_t key[KEY_SIZE];
-            
-            key_from_hex((uint8_t*)pubkeyhex, key);
-
-            // execution to here means we have a valid public key
-
-            //nb:todo: this code assumes the fds are on the same line/inline
-            // we can now parse fds
-            for(; *x != '\0' && *x != '\n' && *x != '[' && *x != ']'; ++x);
-
-            if (*x++ != '[')
-                continue;
-
-            int userfd;
-            if (!sscanf(x, "%d", &userfd))
-                continue;
-
-            // execution to here means we have public key and userfd
-
-            int nbytes;
+            // there might be some bytes pending on this input, if there are we need to bill for them, one coin per byte
+            int nbytes = 0;
             ioctl(userfd, FIONREAD, &nbytes);
+            int64_t to_bill = 1 + nbytes; // and one coin per round for being connected too
 
-            int64_t to_bill = 1 + nbytes;
+            if (DEBUG)
+                printf("tobill: %lu\n", to_bill);
 
             // commence billing
 
@@ -365,13 +405,17 @@ int pass_through_mode(int argc, char** argv) {
                 fwrite(entry, RECORD_SIZE, 1, f);
             } else { 
                 // is user doesn't exist this is an error but we can't do anything about it in passthrough mode so ignore 
+                if (DEBUG) {
+                    printf("user not found key:");
+                    print_hex(key, KEY_SIZE);
+                    printf("\n");
+                }
                 continue;
             }
-
         }
-        
-    }
 
+    } while (!feof(stdin)); 
+    
     
     close(teepipe[1]);
     dup2(teepipe[0], 0);
@@ -391,6 +435,8 @@ int credit_mode(int argc, char** argv) {
         return 128;
     }
 
+    if (correct_for_ed_keys(argc, argv, 2, 0))
+        return 128;
 
     // sanity check our inputs
     for (int i = 0; i < argc; i += 2) {
@@ -488,6 +534,8 @@ int check_mode(int argc, char** argv, int print_balances) {
         return 128;
     }
 
+    if (correct_for_ed_keys(argc, argv, 1, 0))
+        return 128;
     
     for (int i = 0; i < argc; ++i) {
         for (char* x = argv[i];; ++x) {
