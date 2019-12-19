@@ -27,7 +27,7 @@
 #define MAX(a,b) (((a)>(b))?(a):(b))
 
 #define TABLE_FILE "appbill.table"
-
+#define TABLE_FILE_2 "./state/appbill.table" // if TABLE_FILE can't be found try here
 
 uint64_t new_balance(uint64_t balance, int64_t to_credit) {
     if (to_credit < 0 && -to_credit > balance) {
@@ -300,13 +300,17 @@ int pass_through_mode(int argc, char** argv) {
         return 128;
     }
 
+    FILE* teepipeout = fdopen(teepipe[1], "w");
 
     // todo: make this all zero copy when someone has time to debug tee and vmsplice readmode    
     // for now we'll just do a dumb read
 
     FILE* f = fopen(TABLE_FILE, "rb+");
+    if (!f)
+        f = fopen(TABLE_FILE_2, "rb+");
+        
     if (!f) {
-        fprintf(stderr, "could not open %s\n", TABLE_FILE);
+        fprintf(stderr, "could not open %s or %s\n", TABLE_FILE, TABLE_FILE_2);
         return 128;
     }    
 
@@ -322,15 +326,26 @@ int pass_through_mode(int argc, char** argv) {
     do {
         char c = 0;
         bytes_read = 0;
-        while ( (c = getc( stdin )) != EOF && c != ',' && c != '{' && c != '}' && c != '[' && c != ']' && c != '\n' && c != ':' && bytes_read < 1023 )
+        while ( (c = getc( stdin )) != EOF && c != ',' && c != '{' && c != '}' && c != '[' && c != ']' && c != '\n' && c != ':' && bytes_read < 1023 ) {
             buf[bytes_read++] = c;
+            putc(c, teepipeout); // make a copy for the next program
+        }
+        if (c != EOF) putc(c, teepipeout); // make a copy for the next program
+
+        if (c == EOF)
+            break;
+
+        if (mode == 2)
+            continue;
+
         buf[bytes_read] = '\0';
 
         if (mode == 0 && strcmp("\"usrfd\"", buf) == 0)  {
             mode = 1;
             continue;
         }  else if ( mode == 1 && c == '}' ) {
-            break;
+            mode = 2;
+            continue;
         } 
 
         if (buf[0] == '\0' || !mode)
@@ -383,9 +398,29 @@ int pass_through_mode(int argc, char** argv) {
             if (DEBUG) printf("mode=2 userfd=%d\n", userfd);
 
             // there might be some bytes pending on this input, if there are we need to bill for them, one coin per byte
-            int nbytes = 0;
-            ioctl(userfd, FIONREAD, &nbytes);
-            int64_t to_bill = 1 + nbytes; // and one coin per round for being connected too
+            
+            /*int nbytes = 0;
+            ioctl(userfd, FIONREAD, &nbytes);*/
+
+            int64_t to_bill = 0; // and one coin per round for being connected too // no change that to 0 because otherwise malicious nodes can drain accounts!
+
+            //todo: replace all this rubbish with a properly tested zero copy approach
+            int userpipe[2];
+            pipe(userpipe); //todo: handle possible error condition here
+            FILE* userfile = fdopen(userfd, "r");
+            FILE* newuserfile = fdopen(userpipe[1], "w");
+            
+            char x = 0;
+            while ((x = getc(userfile)) != EOF) {
+                if (to_bill < (uint64_t)-1)
+                    to_bill++;
+                putc(x, newuserfile);
+            }
+           
+            fclose(newuserfile);
+            fclose(userfile);
+            dup2(userpipe[0], userfd);
+
 
             if (DEBUG)
                 printf("tobill: %lu\n", to_bill);
@@ -416,7 +451,8 @@ int pass_through_mode(int argc, char** argv) {
         }
 
     } while (!feof(stdin)); 
-    
+   
+    fflush(teepipeout); 
     
     close(teepipe[1]);
     dup2(teepipe[0], 0);
@@ -471,8 +507,11 @@ int credit_mode(int argc, char** argv) {
     }
 
     FILE* f = fopen(TABLE_FILE, "rb+");
+    if (!f) 
+        f = fopen(TABLE_FILE_2, "rb+");
+    
     if (!f) {
-        fprintf(stderr, "could not open %s\n", TABLE_FILE);
+        fprintf(stderr, "could not open %s or %s\n", TABLE_FILE, TABLE_FILE_2);
         return 128;
     }
      
@@ -533,15 +572,23 @@ int check_mode(int argc, char** argv, int print_balances) {
     if (DEBUG)
         printf("check mode\n");
 
-    if (argc > 7 && !print_balances) {
+    if (argc > 14 && !print_balances) {
         fprintf(stderr, "appbill can only take up to 7 keys at a time\n");
         return 128;
     }
 
-    if (correct_for_ed_keys(argc, argv, 1, 0))
+    if (argc == 0 || argc % 2 == 1 && !print_balances) {
+        fprintf(stderr, "appbill check mode requires a public key%s\n", (print_balances ? "" : " and an amount to check against"));
+        return 128;
+    }
+        
+
+    
+    if (correct_for_ed_keys(argc, argv, (print_balances ? 1 : 2), 0))
         return 128;
     
-    for (int i = 0; i < argc; ++i) {
+    for (int i = 0; i < argc; i+= ( print_balances ? 1 : 2 )) {
+        // check the pubkey
         for (char* x = argv[i];; ++x) {
             if ( x - argv[i] == KEY_SIZE*2 && *x != '\0' ) {
                 fprintf(stderr, "appbill was supplied an invalid public key\n");
@@ -557,6 +604,18 @@ int check_mode(int argc, char** argv, int print_balances) {
             fprintf(stderr, "appbill was supplied an invalid public key (not hex) char=%c\n", *x);
             return 128;
         }
+
+        if (print_balances)
+            continue;
+
+        // check the bytecount
+        for (char* x = argv[i+1]; *x != '\0'; ++x) {
+            if (*x >= '0' && *x <= '9')
+                continue;
+            fprintf(stderr, "appbill was supplied invalid byte count %s\n", argv[i+1]);
+            return 128;
+        }
+        
     }
 
     if (print_balances)
@@ -565,9 +624,11 @@ int check_mode(int argc, char** argv, int print_balances) {
     // open app bill table
 
     FILE* f = fopen(TABLE_FILE, "rb");
+    if (!f)
+        f = fopen(TABLE_FILE_2, "rb");
 
     if (!f) {
-        fprintf(stderr, "%s not found\n", TABLE_FILE);
+        fprintf(stderr, "could not open table file at %s or %s\n", TABLE_FILE, TABLE_FILE_2);
         return 128;
     }
 
@@ -576,16 +637,20 @@ int check_mode(int argc, char** argv, int print_balances) {
         bits[i] = 0;
 
     // loop keys, check balances
-    for (int i = 0; i < argc; ++i) {
+    for (int i = 0, j = 0; i < argc; i+=( print_balances ? 1 : 2 ), ++j) {
         // convert the argv from hex to binary 
         uint8_t key[32];
         key_from_hex((uint8_t*)argv[i], key);
+
+        uint32_t bytecount = 0;
+        if (!print_balances)
+            sscanf(argv[i+1], "%d", &bytecount);
 
         int error = 0;
         uint64_t balance = 0;
         size_t recordno = 0;
         if (binary_file_search(f, key, 0, &balance, &recordno, &error)) {
-            if (i < 7) bits[i] = 1;
+            if (j < 7) bits[j] = balance > bytecount;
             if (print_balances) {
                 printf("\t\"");
                 print_hex(key, KEY_SIZE);
